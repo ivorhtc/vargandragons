@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mapa</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #111;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      font-family: 'Courier New', monospace;
+    }
+
+    #viewport {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      position: relative;
+      cursor: grab;
+    }
+    #viewport.dragging { cursor: grabbing; }
+
+    #map-wrapper {
+      position: absolute;
+      top: 0;
+      left: 0;
+      transform-origin: 0 0;
+      will-change: transform;
+    }
+
+    #map-img {
+      display: block;
+      user-select: none;
+      -webkit-user-drag: none;
+      pointer-events: none;
+      image-rendering: auto;
+    }
+    #map-img.pixelated {
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+
+    /* HUD — bottom right */
+    #hud {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: rgba(0, 0, 0, 0.72);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #ccc;
+      font-size: 12px;
+      line-height: 1.8;
+      pointer-events: none;
+      backdrop-filter: blur(4px);
+    }
+    #hud span { color: #fff; font-weight: bold; }
+
+    /* Zoom buttons — bottom left */
+    #zoom-controls {
+      position: fixed;
+      bottom: 20px;
+      left: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .zoom-btn {
+      width: 40px;
+      height: 40px;
+      background: rgba(0, 0, 0, 0.72);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 22px;
+      line-height: 1;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(4px);
+      transition: background 0.15s;
+      user-select: none;
+    }
+    .zoom-btn:hover { background: rgba(255,255,255,0.15); }
+    .zoom-btn:active { background: rgba(255,255,255,0.25); }
+
+    /* Zoom level track — left side */
+    #zoom-track {
+      position: fixed;
+      left: 20px;
+      top: 50%;
+      transform: translateY(-50%);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      align-items: center;
+    }
+    .zoom-pip {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.2);
+      cursor: pointer;
+      transition: background 0.15s, transform 0.15s;
+    }
+    .zoom-pip:hover { background: rgba(255,255,255,0.5); transform: scale(1.3); }
+    .zoom-pip.active { background: #fff; transform: scale(1.3); }
+
+    /* Crosshair — center indicator */
+    #crosshair {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    #crosshair.visible { opacity: 1; }
+    #crosshair::before,
+    #crosshair::after {
+      content: '';
+      position: absolute;
+      background: rgba(255, 255, 255, 0.6);
+    }
+    #crosshair::before { width: 20px; height: 1px; top: 0; left: -10px; }
+    #crosshair::after  { width: 1px; height: 20px; top: -10px; left: 0; }
+  </style>
+</head>
+<body>
+
+  <div id="viewport">
+    <div id="map-wrapper">
+      <!-- Put your image file in the same folder as this HTML file -->
+      <img id="map-img" src="mapa.png" alt="Mapa" draggable="false" />
+    </div>
+  </div>
+
+  <div id="hud">
+    X: <span id="hud-x">—</span><br>
+    Y: <span id="hud-y">—</span><br>
+    Zoom: <span id="hud-z">—</span> / 12
+  </div>
+
+  <div id="zoom-controls">
+    <button class="zoom-btn" id="btn-zoom-in"  title="Zoom in (+)">+</button>
+    <button class="zoom-btn" id="btn-zoom-out" title="Zoom out (−)">−</button>
+  </div>
+
+  <div id="zoom-track"></div>
+
+  <div id="crosshair"></div>
+
+  <script>
+    // ── Config ──────────────────────────────────────────────────────────────
+    const IMAGE_FILE = 'mapaV2.png';  // filename of your map image
+    const IMG_W      = 4096;        // image width in pixels
+    const IMG_H      = 4096;        // image height in pixels
+    const MIN_ZOOM   = 1;
+    const MAX_ZOOM   = 12;
+    const DEFAULT_Z  = 4;           // zoom level shown when no URL param given
+
+    // Scale at each zoom level (logarithmic: z=1 → 0.10×, z=12 → 4.0×)
+    const MIN_SCALE = 0.10;
+    const MAX_SCALE = 4.00;
+    function zoomToScale(z) {
+      return MIN_SCALE * Math.pow(MAX_SCALE / MIN_SCALE, (z - 1) / (MAX_ZOOM - 1));
+    }
+
+    // ── State ────────────────────────────────────────────────────────────────
+    let tx = 0, ty = 0;       // current translate in px
+    let z  = DEFAULT_Z;       // current zoom level (1–12)
+    let sc = zoomToScale(z);  // current scale
+
+    // ── DOM refs ─────────────────────────────────────────────────────────────
+    const viewport  = document.getElementById('viewport');
+    const wrapper   = document.getElementById('map-wrapper');
+    const img       = document.getElementById('map-img');
+    const hudX      = document.getElementById('hud-x');
+    const hudY      = document.getElementById('hud-y');
+    const hudZ      = document.getElementById('hud-z');
+    const crosshair = document.getElementById('crosshair');
+    const track     = document.getElementById('zoom-track');
+
+    // ── Zoom track pips ──────────────────────────────────────────────────────
+    for (let i = MAX_ZOOM; i >= MIN_ZOOM; i--) {
+      const pip = document.createElement('div');
+      pip.className = 'zoom-pip';
+      pip.dataset.z = i;
+      pip.title = `Zoom ${i}`;
+      pip.addEventListener('click', () => zoomAt(i, vw() / 2, vh() / 2));
+      track.appendChild(pip);
+    }
+
+    function updatePips() {
+      track.querySelectorAll('.zoom-pip').forEach(p => {
+        p.classList.toggle('active', parseInt(p.dataset.z) === z);
+      });
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    const vw = () => viewport.clientWidth;
+    const vh = () => viewport.clientHeight;
+
+    function clampTranslate() {
+      // Optional: prevent dragging the image entirely off screen
+      const minTx = Math.min(0, vw() - IMG_W * sc);
+      const minTy = Math.min(0, vh() - IMG_H * sc);
+      tx = Math.max(minTx, Math.min(0, tx));
+      ty = Math.max(minTy, Math.min(0, ty));
+    }
+
+    function applyTransform() {
+      wrapper.style.transform = `translate(${tx}px,${ty}px) scale(${sc})`;
+      img.classList.toggle('pixelated', sc >= 2);
+    }
+
+    function centerOnPixel(px, py, newZ) {
+      z  = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(newZ)));
+      sc = zoomToScale(z);
+      tx = vw() / 2 - px * sc;
+      ty = vh() / 2 - py * sc;
+      applyTransform();
+      updateHUD();
+      updatePips();
+    }
+
+    function imageCenter() {
+      return {
+        x: Math.round((vw() / 2 - tx) / sc),
+        y: Math.round((vh() / 2 - ty) / sc),
+      };
+    }
+
+    function updateHUD() {
+      const { x, y } = imageCenter();
+      hudX.textContent = x;
+      hudY.textContent = y;
+      hudZ.textContent = z;
+    }
+
+    // Zoom while keeping screen point (sx, sy) fixed
+    function zoomAt(newZ, sx, sy) {
+      newZ = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(newZ)));
+      if (newZ === z) return;
+      const newSc = zoomToScale(newZ);
+      tx = sx - (sx - tx) * (newSc / sc);
+      ty = sy - (sy - ty) * (newSc / sc);
+      z  = newZ;
+      sc = newSc;
+      applyTransform();
+      updateHUD();
+      updatePips();
+      scheduleUrlUpdate();
+    }
+
+    // ── URL sync ─────────────────────────────────────────────────────────────
+    let urlTimer;
+    function scheduleUrlUpdate() {
+      clearTimeout(urlTimer);
+      urlTimer = setTimeout(() => {
+        const { x, y } = imageCenter();
+        const u = new URL(window.location);
+        u.searchParams.set('x', x);
+        u.searchParams.set('y', y);
+        u.searchParams.set('z', z);
+        history.replaceState(null, '', u);
+      }, 250);
+    }
+
+    // ── Read URL params on load ───────────────────────────────────────────────
+    const params = new URLSearchParams(window.location.search);
+    const initX  = parseFloat(params.get('x')) || IMG_W / 2;
+    const initY  = parseFloat(params.get('y')) || IMG_H / 2;
+    const initZ  = parseInt(params.get('z'))   || DEFAULT_Z;
+
+    // ── Mouse pan ────────────────────────────────────────────────────────────
+    let dragging = false, lastMX = 0, lastMY = 0;
+
+    viewport.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      dragging = true;
+      lastMX = e.clientX;
+      lastMY = e.clientY;
+      viewport.classList.add('dragging');
+    });
+
+    window.addEventListener('mousemove', e => {
+      if (!dragging) return;
+      tx += e.clientX - lastMX;
+      ty += e.clientY - lastMY;
+      lastMX = e.clientX;
+      lastMY = e.clientY;
+      applyTransform();
+      updateHUD();
+      scheduleUrlUpdate();
+    });
+
+    window.addEventListener('mouseup', () => {
+      dragging = false;
+      viewport.classList.remove('dragging');
+    });
+
+    // ── Mouse wheel zoom ─────────────────────────────────────────────────────
+    viewport.addEventListener('wheel', e => {
+      e.preventDefault();
+      const delta = e.deltaY < 0 ? 1 : -1;
+      zoomAt(z + delta, e.clientX, e.clientY);
+    }, { passive: false });
+
+    // ── Touch: pan + pinch zoom ──────────────────────────────────────────────
+    let lastTouches = [], lastPinchDist = null;
+
+    viewport.addEventListener('touchstart', e => {
+      lastTouches = [...e.touches];
+      if (e.touches.length === 2) {
+        lastPinchDist = Math.hypot(
+          e.touches[1].clientX - e.touches[0].clientX,
+          e.touches[1].clientY - e.touches[0].clientY,
+        );
+      }
+    }, { passive: true });
+
+    viewport.addEventListener('touchmove', e => {
+      e.preventDefault();
+      if (e.touches.length === 1 && lastTouches.length === 1) {
+        tx += e.touches[0].clientX - lastTouches[0].clientX;
+        ty += e.touches[0].clientY - lastTouches[0].clientY;
+        applyTransform();
+        updateHUD();
+        scheduleUrlUpdate();
+      } else if (e.touches.length === 2) {
+        const dist = Math.hypot(
+          e.touches[1].clientX - e.touches[0].clientX,
+          e.touches[1].clientY - e.touches[0].clientY,
+        );
+        const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        if (lastPinchDist !== null) {
+          if (dist / lastPinchDist > 1.08) zoomAt(z + 1, midX, midY);
+          else if (dist / lastPinchDist < 0.92) zoomAt(z - 1, midX, midY);
+        }
+        lastPinchDist = dist;
+      }
+      lastTouches = [...e.touches];
+    }, { passive: false });
+
+    viewport.addEventListener('touchend', () => { lastPinchDist = null; });
+
+    // ── Keyboard shortcuts ───────────────────────────────────────────────────
+    window.addEventListener('keydown', e => {
+      const cx = vw() / 2, cy = vh() / 2;
+      if (e.key === '+' || e.key === '=') zoomAt(z + 1, cx, cy);
+      if (e.key === '-' || e.key === '_') zoomAt(z - 1, cx, cy);
+      if (e.key === 'ArrowRight') { tx -= 80; applyTransform(); updateHUD(); scheduleUrlUpdate(); }
+      if (e.key === 'ArrowLeft')  { tx += 80; applyTransform(); updateHUD(); scheduleUrlUpdate(); }
+      if (e.key === 'ArrowDown')  { ty -= 80; applyTransform(); updateHUD(); scheduleUrlUpdate(); }
+      if (e.key === 'ArrowUp')    { ty += 80; applyTransform(); updateHUD(); scheduleUrlUpdate(); }
+    });
+
+    // ── Zoom buttons ─────────────────────────────────────────────────────────
+    document.getElementById('btn-zoom-in').addEventListener('click', () =>
+      zoomAt(z + 1, vw() / 2, vh() / 2));
+    document.getElementById('btn-zoom-out').addEventListener('click', () =>
+      zoomAt(z - 1, vw() / 2, vh() / 2));
+
+    // ── Crosshair on initial load ─────────────────────────────────────────────
+    function flashCrosshair() {
+      crosshair.classList.add('visible');
+      setTimeout(() => crosshair.classList.remove('visible'), 1200);
+    }
+
+    // ── Boot ─────────────────────────────────────────────────────────────────
+    function init() {
+      centerOnPixel(initX, initY, initZ);
+      flashCrosshair();
+    }
+
+    img.addEventListener('load', init);
+    if (img.complete) init();
+  </script>
+</body>
+</html>
